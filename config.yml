@@ -1,0 +1,6 @@
+default:
+  sportsline_file: C:/Users/cjohanson/Downloads/cheatsheet_espnnonppr10.xlsx
+  cbs_consensus: C:/Users/cjohanson/Downloads/cbs_consensus.tsv
+  espn_sheet: https://docs.google.com/spreadsheets/d/1luHNK0Vm7kRh9Sg00L7VhN92RQZzfKmmIc0I9_8hvGc/edit#gid=1021345474
+  dst_map_json: https://gist.githubusercontent.com/smykes/368afa60c1a75b3d5468/raw/9205194e4068a0904a682078b66338222f551376/nfl.json
+  espn_cheet_sheet: C:/Users/cjohanson/Downloads/espn_cheat_sheet.txt

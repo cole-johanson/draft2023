@@ -1,0 +1,186 @@
+pos = c('QB','RB','WR','TE','K','DST')
+n_pos = c('QB' = 2, 'RB' = 5, 'WR'=4, 'TE'=2, 'DST'=1, 'K'=1)*10
+filter_to_pos <- function(df, n_pos) {
+  purrr::map_dfr(1:length(n_pos), ~df %>% filter(pos == names(n_pos)[.x]) %>% slice(1:(n_pos[.x])))
+}
+
+############################################################################################################
+#### Sportsline
+############################################################################################################
+read_sportsline_sheet <- function(sheet) {
+  readxl::read_excel(config::get('sportsline_file'), sheet=sheet) |>
+    dplyr::mutate(pos=sheet)
+}
+
+# Sportsline is ranked per position from 99 (best) to 1 (worst)
+# We set a per_pos_ranking as 1-99
+sportsline = purrr::map_dfr(pos, read_sportsline_sheet) |>
+  filter(!is.na(PLAYER)) |>
+  mutate(rating = as.numeric(`OPTIMAL POSITION RATING`)) |>
+  arrange(desc(rating)) |>
+  filter_to_pos(n_pos) |>
+  group_by(pos) |>
+  mutate(
+    PLAYER = str_replace_all(PLAYER, "[\\.]",""),
+    dropoff = rating - dplyr::lead(rating),
+    ROUND = as.numeric(ROUND)
+  ) |>
+  arrange(rating) |>
+  mutate(
+    # value is the cumulative dropoff for players below the player (e.g.)
+    # E.g. take RB6 -> WR7 -> WR8 -> RB9 -> RB10. RB6's dropoff is 3, and value is 3+1+...
+    # Thus RB6's value is 3 higher than RB9
+    value = cumsum(replace_with_prev(dropoff)),
+    value = value - mean(value, na.rm=T)
+  ) |>
+  ungroup() |>
+  mutate(value = scale_value(value)) |>
+  select(PLAYER, pos, sportsline_value=value, sportsline_round=ROUND)
+
+############################################################################################################
+#### CBS
+############################################################################################################
+
+# CBS is simply a rank of the top 200 so we should view the row number as the ADP
+# We set the value:
+#    Arrange players by their ADP
+#    Per position, set the dropoff of their ADP to the next player in that position's ADP
+#    Set the value as the player's (+ all the players below that player's) cumulative dropoff
+#    Scale the value per position
+#
+#    If we wanted to functionalize this, we would just need ADP and pos
+cbs = readr::read_tsv(config::get('cbs_consensus'), col_types = readr::cols(PLAYER = readr::col_character(), pos = readr::col_character())) |>
+  mutate(
+    adp = dplyr::row_number()
+  ) |>
+  filter_to_pos(n_pos) |>
+  group_by(pos) |>
+  arrange(adp) |>
+  mutate(
+    # dropoff is how many ranks above the next player
+    dropoff = dplyr::lead(adp) - adp
+  ) |>
+  arrange(desc(adp)) |>
+  mutate(
+    # value is the cumulative dropoff for players below the player (e.g.)
+    # E.g. take RB6 -> WR7 -> WR8 -> RB9 -> RB10. RB6's dropoff is 3, and value is 3+1+...
+    # Thus RB6's value is 3 higher than RB9
+    value = cumsum(replace_with_prev(dropoff))
+  ) |>
+  ungroup() |>
+  mutate(
+    player_regex = case_when(
+      grepl('^[A-Z]\\. [A-Za-z ]+$', PLAYER)~str_replace(PLAYER,'\\.','.*'),
+      TRUE~PLAYER
+    ),
+    value = scale_value(value)
+  ) |>
+  select(player_regex, pos, cbs_overall_rank = adp, cbs_value = value)
+
+############################################################################################################
+#### ESPN
+############################################################################################################
+
+read_espn <- function(pos) {
+  googlesheets4::read_sheet(config::get('espn_sheet'), sheet = pos) |>
+    dplyr::mutate(pos=pos)
+}
+
+#espn_raw = purrr::map_dfr(pos, read_espn)
+# espn = espn_raw |>
+#   group_by(pos) |>
+#   arrange(AVG) |>
+#   mutate(
+#     # dropoff is how many ranks above the next player
+#     dropoff = dplyr::lead(AVG) - AVG
+#   ) |>
+#   arrange(desc(AVG)) |>
+#   mutate(
+#     # value is the cumulative dropoff for players below the player (e.g.)
+#     # E.g. take RB6 -> WR7 -> WR8 -> RB9 -> RB10. RB6's dropoff is 3, and value is 3+1+...
+#     # Thus RB6's value is 3 higher than RB9
+#     value = cumsum(replace_with_prev(dropoff)),
+#     value = scale_value(value) - mean(value, na.rm=T)
+#   ) |>
+#   ungroup() |>
+#   mutate(
+#     PLAYER = str_replace(`Rank, Player`, ', [A-Za-z]+$', '') |> # Remove team suffix
+#       str_replace('^[0-9]+\\. ', '') |> # Remove rank prefix
+#       str_replace(' D/ST$',''), # Remove extraneous 'D/ST'
+#     value = scale_value(value)
+#   ) |>
+#   select(PLAYER, pos, espn_overall_rank = AVG, espn_value = value)
+#
+cheat_sheet_text = readLines(config::get('espn_cheet_sheet'))
+get_columns <- function(cheat_sheet_text) {
+  column_extract_regex = '^[0-9]+\\. \\([A-Z]+[0-9]+\\) [0-9A-Za-z\\. \'\\-/]+, [A-Z]+ \\$[0-9]+ [0-9]+ ?'
+  columns = tibble::tibble(column=character())
+  i=0
+  for(line in cheat_sheet_text) {
+    i=i+1
+    while(nchar(line) > 0) {
+      if(!str_detect(line, column_extract_regex)) line = ""
+      columns = columns %>% add_row(column = str_extract(line, column_extract_regex))
+      line = str_replace(line, column_extract_regex, '')
+    }
+  }
+  return(columns)
+}
+
+columns = get_columns(cheat_sheet_text)
+x = columns |>
+  mutate(
+    g = str_match_all(column, '^(?<rank>[0-9]+)\\. \\((?<pos>[A-Z]+)[0-9]+\\) (?<PLAYER>[0-9A-Za-z\\. \'\\-/]+), [A-Z]+ \\$(?<rating>[0-9]+) [0-9]+ ?')
+    #rank = str_extract(column, '^[0-9]+'),
+    #pos = '^[0-9]+\\. \\(\\([A-Z]+\\)[0-9]+\\)'
+  )
+
+espn_cheat_sheet_raw = purrr::map(pull(x,g), as.data.frame) |>
+  purrr::list_rbind() |>
+  as_tibble()
+
+espn_cheat_sheet = espn_cheat_sheet_raw |>
+  mutate(
+    rating = as.numeric(rating),
+    rank = as.numeric(rank),
+    PLAYER = str_replace_all(PLAYER, '[\\.]', '') |>
+      str_replace(' D/ST$','')
+  ) |>
+  arrange(rank) |>
+  filter_to_pos(n_pos) |>
+  group_by(pos) |>
+  mutate(
+    dropoff = rating - coalesce(dplyr::lead(rating),0)
+  ) |>
+  arrange(rating) |>
+  mutate(
+    # value is the cumulative dropoff for players below the player (e.g.)
+    # E.g. take RB6 -> WR7 -> WR8 -> RB9 -> RB10. RB6's dropoff is 3, and value is 3+1+...
+    # Thus RB6's value is 3 higher than RB9
+    value = cumsum(replace_with_prev(dropoff)),
+    value = value - mean(value, na.rm=T)
+  ) |>
+  ungroup() |>
+  mutate(value = scale_value(value)) |>
+  select(PLAYER, pos, espn_rank = rank, espn_value = value)
+
+############################################################################################################
+#### D/ST map
+############################################################################################################
+dst_map = jsonlite::fromJSON(config::get('dst_map_json'))
+
+############################################################################################################
+#### Merge
+############################################################################################################
+overall = sportsline |>
+  full_join(espn_cheat_sheet, by = c("PLAYER", "pos")) |>
+  fuzzyjoin::regex_full_join(cbs |> select(-pos), by = c("PLAYER" = "player_regex")) |>
+  mutate_at(vars(contains("_value")), ~coalesce(.,0)) %>%
+  mutate(
+    avg_value = round((espn_value + sportsline_value + cbs_value)/3, 1)
+  ) %>% arrange(desc(avg_value))
+
+googlesheets4::write_sheet(
+  overall,
+  "https://docs.google.com/spreadsheets/d/15lT7yaLF27vUR48KikooXetWlwDy2fN6fb27MtVLztc/edit#gid=0"
+)
